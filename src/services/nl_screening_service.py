@@ -8,7 +8,7 @@ from ..scorer import StockScore, FundamentalScorer, MarketEnvScorer, TechnicalSc
 
 _RECENT_DAYS = 180
 _STOCK_TIMEOUT = 8
-_MAX_CANDIDATES = 8
+_MAX_SCORE_CONCURRENT = 100  # 最多并发评分的股票数，防止超时
 
 # 行业关键词 → 名称匹配模式（用于在全市场股票名称中筛选）
 INDUSTRY_NAME_PATTERNS: dict[str, list[str]] = {
@@ -189,8 +189,9 @@ def _filter_stock_pool(intent: dict) -> tuple[list[dict], str]:
     # 排序：优先按市值，没有市值则按名称
     if (pool["mktcap"] > 0).any():
         pool = pool.sort_values("mktcap", ascending=False)
-    if len(pool) > _MAX_CANDIDATES * 3:
-        pool = pool.head(_MAX_CANDIDATES * 3)
+    # 限制并发评分数量，防止超时
+    if len(pool) > _MAX_SCORE_CONCURRENT:
+        pool = pool.head(_MAX_SCORE_CONCURRENT)
 
     candidates = []
     for _, row in pool.iterrows():
@@ -356,8 +357,8 @@ def screen_by_natural_language(query: str) -> dict:
         result["market_score"] = market_score
         result["market_trend"] = market_trend
 
-        # Step 3: 并发K线评分（取前 N 只）
-        codes = [c["code"] for c in candidates[:_MAX_CANDIDATES]]
+        # Step 3: 并发K线评分
+        codes = [c["code"] for c in candidates]
         name_map = {c["code"]: c["name"] for c in candidates}
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(codes))) as executor:

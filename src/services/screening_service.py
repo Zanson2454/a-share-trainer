@@ -66,7 +66,7 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
 
         result["pool_source"] = pool_source
 
-        for code in hot_codes[:5]:
+        for code in hot_codes:
             stock = StockScore(code=code)
             kline = AKShareClient.get_daily_kline(code)
             if kline is None or kline.empty:
