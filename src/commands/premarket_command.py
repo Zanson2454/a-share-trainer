@@ -1,10 +1,11 @@
 """
-/盘前 — 盘前环境分析：大盘、政策、热点、风险
+/盘前 — 盘前环境分析：大盘、道氏确认、政策、热点、风险
 """
 from datetime import datetime
 from ..data.akshare_client import AKShareClient
 from ..scorer import MarketEnvScorer
 from ..obsidian_sync import ObsidianSync
+from ..services.premarket_service import check_dow_confirmation
 
 
 def execute(args: list = None) -> str:
@@ -41,6 +42,24 @@ def execute(args: list = None) -> str:
             lines.append("")
     else:
         lines.append("⚠️ AKShare 未安装。安装：`" + AKShareClient.install_guide() + "`")
+        lines.append("")
+
+    # 1.5 道氏确认
+    lines.append("### 一之补充：道氏确认（指数相互验证）")
+    lines.append("")
+    try:
+        dow = check_dow_confirmation()
+        lines.append("**" + dow["overall"] + "**")
+        lines.append("")
+        lines.append("| 对照组 | 经济含义 | 信号 | 详情 |")
+        lines.append("|--------|----------|------|------|")
+        for pair in dow.get("pairs", []):
+            lines.append("| {} | {} | {} | {} |".format(
+                pair["name"], pair["desc"], pair["signal"], pair.get("detail", "")
+            ))
+        lines.append("")
+    except Exception as e:
+        lines.append("⚠️ 道氏确认获取失败: " + str(e))
         lines.append("")
 
     # 2. 政策方向

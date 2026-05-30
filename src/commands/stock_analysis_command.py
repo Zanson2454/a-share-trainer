@@ -84,19 +84,53 @@ def execute(args: list = None) -> str:
         lines.append("")
         fin = AKShareClient.get_financial_data(code)
         if fin:
-            pe_val = fin.get("pe", "N/A")
-            pe_label = "合理" if (isinstance(pe_val, (int, float)) and pe_val < 30) else "偏高"
-            roe_val = fin.get("roe", "N/A")
-            roe_label = "优秀" if (isinstance(roe_val, (int, float)) and roe_val > 15) else "一般"
-            debt_val = fin.get("debt_ratio", "N/A")
-            debt_label = "安全" if (isinstance(debt_val, (int, float)) and debt_val < 50) else "高杠杆"
+            is_sina = fin.get("_sina_source", False)
+            is_ts = fin.get("_ts_source", False)
+            name_hint = fin.get("_name", "")
+            mktcap_hint = fin.get("_mktcap", 0)
+            report_date = fin.get("_report_date", "")
+
+            pe_val = fin.get("pe", None)
+            pe_label = "合理" if (isinstance(pe_val, (int, float)) and pe_val < 30) else ("偏高" if isinstance(pe_val, (int, float)) else "N/A")
+            pb_val = fin.get("pb", None)
+            roe_val = fin.get("roe", None)
+            roe_label = "优秀" if (isinstance(roe_val, (int, float)) and roe_val > 15) else ("一般" if isinstance(roe_val, (int, float)) else "N/A")
+            debt_val = fin.get("debt_ratio", None)
+            debt_label = "安全" if (isinstance(debt_val, (int, float)) and debt_val < 50) else ("高杠杆" if isinstance(debt_val, (int, float)) and debt_val >= 50 else "N/A")
+            rev_g = fin.get("revenue_growth", None)
+            rev_label = "增长" if (isinstance(rev_g, (int, float)) and rev_g > 0) else ("下滑" if isinstance(rev_g, (int, float)) else "N/A")
+            profit_g = fin.get("profit_growth", None)
+            profit_label = "增长" if (isinstance(profit_g, (int, float)) and profit_g > 0) else ("下滑" if isinstance(profit_g, (int, float)) else "N/A")
+
+            if name_hint:
+                lines.append(f"- 名称: **{name_hint}**")
+            if mktcap_hint > 0:
+                lines.append(f"- 总市值: **{mktcap_hint:.0f}亿**")
+            lines.append("")
             lines.append("| 指标 | 数值 | 评价 |")
             lines.append("|------|------|------|")
-            lines.append("| PE | {} | {} |".format(pe_val, pe_label))
-            lines.append("| PB | {} | |".format(fin.get("pb", "N/A")))
-            lines.append("| ROE | {}% | {} |".format(roe_val, roe_label))
-            lines.append("| 负债率 | {}% | {} |".format(debt_val, debt_label))
+            pe_display = f"{pe_val:.1f}" if isinstance(pe_val, (int, float)) else "N/A"
+            lines.append(f"| PE(TTM) | {pe_display} | {pe_label} |")
+            pb_display = f"{pb_val:.2f}" if isinstance(pb_val, (int, float)) else "N/A"
+            lines.append(f"| PB | {pb_display} | |")
+            roe_display = f"{roe_val:.1f}%" if isinstance(roe_val, (int, float)) else "N/A"
+            lines.append(f"| ROE | {roe_display} | {roe_label} |")
+            debt_display = f"{debt_val:.1f}%" if isinstance(debt_val, (int, float)) else "N/A"
+            lines.append(f"| 负债率 | {debt_display} | {debt_label} |")
+            rev_display = f"{rev_g:+.1f}%" if isinstance(rev_g, (int, float)) else "N/A"
+            lines.append(f"| 营收增速 | {rev_display} | {rev_label} |")
+            profit_display = f"{profit_g:+.1f}%" if isinstance(profit_g, (int, float)) else "N/A"
+            lines.append(f"| 利润增速 | {profit_display} | {profit_label} |")
             lines.append("")
+            # 数据来源说明
+            sources = []
+            if is_sina:
+                sources.append("Sina(PE/PB/市值)")
+            if is_ts:
+                sources.append(f"Tushare(ROE/负债/增速, {report_date})")
+            if sources:
+                lines.append(f"> 📊 数据来源: {' + '.join(sources)}")
+                lines.append("")
         else:
             lines.append("⚠️ 财务数据获取失败")
             lines.append("")

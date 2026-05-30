@@ -19,3 +19,10 @@ scipy>=1.10.0
 
 # CLI 美化（可选）
 rich>=13.0.0
+
+# AI Agent 分析
+openai>=1.30.0
+
+# Web API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

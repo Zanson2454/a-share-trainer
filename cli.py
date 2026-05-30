@@ -12,6 +12,8 @@ from src.commands import (
     review_command,
     strategy_command,
     backtest_command,
+    wencai_command,
+    agent_command,
 )
 from src.config import Config
 from src.messaging import MessageBus
@@ -28,6 +30,9 @@ COMMANDS = {
     "/复盘": review_command,
     "/策略": strategy_command,
     "/回测": backtest_command,
+    "/问财": wencai_command,
+    "/选股助手": wencai_command,
+    "/agent": agent_command,
 }
 
 

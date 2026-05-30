@@ -24,26 +24,32 @@ class Config:
     WECHAT_APP_ID = os.getenv("WECHAT_APP_ID", "")
     WECHAT_APP_SECRET = os.getenv("WECHAT_APP_SECRET", "")
 
-    # --- Obsidian ---
-    OBSIDIAN_VAULT_PATH = os.getenv(
-        "OBSIDIAN_VAULT_PATH",
-        str(Path.home() / "Documents/obsidian/A股训练场")
-    )
-
     # --- 风控 ---
     SIMULATED_CAPITAL = float(os.getenv("SIMULATED_CAPITAL", "100000"))
     MAX_SINGLE_POSITION = float(os.getenv("MAX_SINGLE_POSITION", "0.3"))
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 
+    # --- AI Agent ---
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL = os.getenv(
+        "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
+    )
+    AGENT_DEFAULT_MODEL = os.getenv("AGENT_DEFAULT_MODEL", "deepseek-v4-flash")
+    AGENT_DEEP_MODEL = os.getenv("AGENT_DEEP_MODEL", "deepseek-v4-pro")
+
     # --- 调试 ---
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+    # --- Obsidian ---
+    OBSIDIAN_VAULT_PATH = os.getenv(
+        "OBSIDIAN_VAULT_PATH",
+        str(Path.home() / "Documents/obsidian/A股训练场"),
+    )
 
     @classmethod
     def validate(cls) -> list[str]:
         """检查必要配置是否完整，返回缺失项列表"""
         missing = []
-        # 数据源至少有一个可用
-        # AKShare 无需配置，Tushare 可选
         return missing
 
     @classmethod

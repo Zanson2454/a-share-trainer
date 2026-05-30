@@ -29,9 +29,10 @@ def _simple_ma_cross_strategy(df, shares, cash):
 def _ma_cross_enhanced_strategy(df, shares, cash):
     """
     均线金叉增强版：
-    1. 道氏趋势过滤 — 只在200日均线上方做多
-    2. 成交量确认 — 金叉日量 > 20日均量 × 1.5
-    3. 葛兰威尔买点2 — 持仓后回调至20日均线获支撑时加仓
+    ① 道氏趋势过滤 — 只在200日均线上方做多
+    ② 成交量确认 — 金叉日量 > 20日均量 × 1.5
+    ③ 葛兰威尔买点2 — 持仓后回调至20日均线获支撑时加仓
+    ⑥ 乖离率止盈 — 价格远离MA20超过15%主动止盈
     """
     if len(df) < 200:
         return None
@@ -46,33 +47,120 @@ def _ma_cross_enhanced_strategy(df, shares, cash):
     volume = latest.get("volume", 0)
     vol_ma20 = latest.get("vol_ma20", 0)
 
-    # 死叉卖出（不受趋势过滤影响，持仓就必须检查）
+    # ── ⑥ 乖离率止盈：价格远离均线时主动止盈 ──
+    if shares > 0 and ma20 > 0:
+        deviation = (price - ma20) / ma20 * 100
+        if deviation > 15:
+            return {"action": "sell", "quantity": shares,
+                    "reason": f"乖离率 {deviation:.1f}%，远离MA20主动止盈"}
+
+    # 死叉卖出
     if prev_ma5 >= prev_ma20 and ma5 < ma20 and shares > 0:
         return {"action": "sell", "quantity": shares, "reason": "MA5下穿MA20死叉"}
 
     # ── 买点1：金叉买入 ──
     golden_cross = prev_ma5 <= prev_ma20 and ma5 > ma20
     if golden_cross and shares == 0:
-        # 过滤1：200日均线趋势确认
+        # ① 过滤1：200日均线趋势确认
         if ma200 <= 0 or price <= ma200:
-            return None  # 趋势不配合，不做多
-        # 过滤2：成交量确认
+            return None
+        # ② 过滤2：成交量确认
         if vol_ma20 > 0 and volume < vol_ma20 * 1.5:
-            return None  # 缩量金叉，不参与
+            return None
         qty = int(cash * 0.8 / price) // 100 * 100
         if qty > 0:
             return {"action": "buy", "quantity": qty,
                     "reason": "金叉(趋势+放量确认)"}
 
-    # ── 买点2：葛兰威尔回调加仓 ──
+    # ── ③ 买点2：葛兰威尔回调加仓 ──
     if shares > 0 and cash > 0:
-        # 价格回踩20日均线附近（收盘在MA20上方1%以内）
         near_ma20 = ma20 > 0 and (price - ma20) / ma20 <= 0.01
-        # 且前一天收盘在MA20上方较远处（今天是回调日）
         prev_close = prev["close"]
         prev_near_ma20 = ma20 > 0 and (prev_close - ma20) / ma20 > 0.01
         if near_ma20 and prev_near_ma20 and price > ma20:
-            add_qty = int(cash * 0.3 / price) // 100 * 100  # 用剩余现金30%加仓
+            add_qty = int(cash * 0.3 / price) // 100 * 100
+            if add_qty > 0:
+                return {"action": "buy", "quantity": add_qty,
+                        "reason": "葛兰威尔买点2: 回踩MA20获支撑"}
+
+    return None
+
+
+def _ma_cross_dow_gann_strategy(df, shares, cash):
+    """
+    均线金叉道氏江恩版（完整理论叠加）：
+    ① 道氏趋势过滤 — MA200上方做多
+    ② 成交量确认 — 金叉日量 > 20日均量 × 1.5
+    ③ 葛兰威尔买点2 — 回调MA20获支撑加仓
+    ④ 江恩50%回调位 + 金叉共振 — 高胜率入场点
+    ⑥ 乖离率止盈 — 偏离MA20 >15%主动止盈
+    """
+    if len(df) < 200:
+        return None
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    price = latest["close"]
+    ma5 = latest.get("ma5", 0)
+    ma20 = latest.get("ma20", 0)
+    ma200 = latest.get("ma200", 0)
+    prev_ma5 = prev.get("ma5", 0)
+    prev_ma20 = prev.get("ma20", 0)
+    volume = latest.get("volume", 0)
+    vol_ma20 = latest.get("vol_ma20", 0)
+
+    # ── ⑥ 乖离率止盈 ──
+    if shares > 0 and ma20 > 0:
+        deviation = (price - ma20) / ma20 * 100
+        if deviation > 15:
+            return {"action": "sell", "quantity": shares,
+                    "reason": f"乖离率 {deviation:.1f}%，远离MA20主动止盈"}
+
+    # 死叉卖出
+    if prev_ma5 >= prev_ma20 and ma5 < ma20 and shares > 0:
+        return {"action": "sell", "quantity": shares, "reason": "MA5下穿MA20死叉"}
+
+    # ── 买点：金叉判断 ──
+    golden_cross = prev_ma5 <= prev_ma20 and ma5 > ma20
+    if golden_cross and shares == 0:
+        # ① MA200趋势过滤
+        if ma200 <= 0 or price <= ma200:
+            return None
+        # ② 成交量过滤
+        if vol_ma20 > 0 and volume < vol_ma20 * 1.5:
+            return None
+
+        # ④ 江恩50%回调位计算
+        gann_signal = False
+        gann_detail = ""
+        lookback = min(120, len(df) - 1)  # 往前看最多120天
+        if lookback >= 40:
+            recent_high = float(df["high"].iloc[-lookback:-1].max())
+            recent_low = float(df["low"].iloc[-lookback:-1].min())
+            if recent_high > recent_low:
+                retrace_50 = (recent_high + recent_low) / 2
+                # 当前价格在50%回调位 ±3% 范围内
+                if abs(price - retrace_50) / retrace_50 <= 0.03:
+                    gann_signal = True
+                    gann_detail = (
+                        f" + 江恩50%共振(波段{recent_low:.0f}-{recent_high:.0f}，"
+                        f"回调位{retrace_50:.0f}，当前{price:.0f})"
+                    )
+
+        qty = int(cash * (0.9 if gann_signal else 0.8) / price) // 100 * 100
+        if qty > 0:
+            if gann_signal:
+                reason = "金叉(道氏+量能" + gann_detail + ")"
+            else:
+                reason = "金叉(道氏+量能确认)"
+            return {"action": "buy", "quantity": qty, "reason": reason}
+
+    # ── ③ 买点2：葛兰威尔回调加仓 ──
+    if shares > 0 and cash > 0:
+        near_ma20 = ma20 > 0 and (price - ma20) / ma20 <= 0.01
+        prev_close = prev["close"]
+        prev_near_ma20 = ma20 > 0 and (prev_close - ma20) / ma20 > 0.01
+        if near_ma20 and prev_near_ma20 and price > ma20:
+            add_qty = int(cash * 0.3 / price) // 100 * 100
             if add_qty > 0:
                 return {"action": "buy", "quantity": add_qty,
                         "reason": "葛兰威尔买点2: 回踩MA20获支撑"}
@@ -84,8 +172,10 @@ def _ma_cross_enhanced_strategy(df, shares, cash):
 STRATEGY_REGISTRY = {
     "均线金叉": _simple_ma_cross_strategy,
     "均线金叉增强版": _ma_cross_enhanced_strategy,
+    "均线金叉道氏江恩": _ma_cross_dow_gann_strategy,
     "ma_cross": _simple_ma_cross_strategy,
     "ma_cross_plus": _ma_cross_enhanced_strategy,
+    "ma_cross_gann": _ma_cross_dow_gann_strategy,
 }
 
 
@@ -101,7 +191,7 @@ def execute(args: list = None) -> str:
     # 验证策略名
     strategy_fn = STRATEGY_REGISTRY.get(strategy_name)
     if strategy_fn is None:
-        available = "、".join(sorted(set(STRATEGY_REGISTRY.keys()) - {"ma_cross", "ma_cross_plus"}))
+        available = "、".join(sorted(set(STRATEGY_REGISTRY.keys()) - {"ma_cross", "ma_cross_plus", "ma_cross_gann"}))
         return (
             f"❌ 未知策略「{strategy_name}」\n"
             f"当前支持的策略: {available}\n"

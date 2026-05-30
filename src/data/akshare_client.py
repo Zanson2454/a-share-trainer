@@ -9,6 +9,8 @@ from pathlib import Path
 import pandas as pd
 from typing import Optional
 
+from .stock_cache import search_cached, needs_sync, sync as sync_cache
+
 
 class AKShareClient:
     """AKShare 数据客户端 — 免费、无需 API Key"""
@@ -122,12 +124,9 @@ class AKShareClient:
     def get_daily_kline(code: str, start_date: str = None, end_date: str = None,
                          period: str = "daily") -> Optional[pd.DataFrame]:
         """
-        获取日K线数据
-        :param code: 股票代码，如 '600519'
-        :param start_date: 开始日期 '20240101'
-        :param end_date: 结束日期 '20241231'
-        :param period: daily/weekly/monthly
-        :return: DataFrame with columns: date, open, high, low, close, volume
+        获取K线数据
+        :param code: 股票代码
+        :param period: daily/weekly/monthly/60/30/15/5/1
         """
         fetcher = AKShareClient._load_sina_fetcher()
         if fetcher is not None and period == "daily":
@@ -146,12 +145,42 @@ class AKShareClient:
                 period=period,
                 start_date=start_date or "20200101",
                 end_date=end_date or pd.Timestamp.now().strftime("%Y%m%d"),
-                adjust="qfq"  # 前复权
+                adjust="qfq"
             )
             if df is not None and not df.empty:
                 return AKShareClient._normalize_kline_df(df)
         except Exception as e:
             print(f"[AKShare] 获取K线失败 {code}: {e}")
+        return None
+
+    @staticmethod
+    def get_kline_for_period(code: str, period: str) -> Optional[pd.DataFrame]:
+        """
+        获取指定周期的K线数据用于形态识别。
+        日线/周线/月线直接获取；15/30/60分钟直接获取；
+        120分钟/4小时通过60分钟数据重采样。
+        """
+        if period in ("daily", "weekly", "monthly"):
+            return AKShareClient.get_daily_kline(code, period=period)
+
+        if period in ("15", "30", "60"):
+            # AKShare stock_zh_a_hist supports 15/30/60 min periods
+            return AKShareClient.get_daily_kline(code, period=period)
+
+        # 120min / 4h → fetch 60min and resample
+        if period in ("120", "4h"):
+            df = AKShareClient.get_daily_kline(code, period="60")
+            if df is None or df.empty:
+                return None
+            freq = "2h" if period == "120" else "4h"
+            df = df.copy()
+            df.set_index("date", inplace=True)
+            resampled = df.resample(freq).agg({
+                "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+            }).dropna()
+            resampled = resampled.reset_index()
+            return resampled
+
         return None
 
     @staticmethod
@@ -203,11 +232,11 @@ class AKShareClient:
 
     @staticmethod
     def get_financial_data(code: str) -> dict:
-        """获取财务指标"""
+        """获取财务指标（AKShare → Sina(PE/PB) → Tushare(ROE/负债/增速) 三源合并）"""
         result = {}
+        # 1. 尝试 AKShare（完整财务，一次搞定）
         try:
             import akshare as ak
-            # 获取主要财务指标
             df = ak.stock_financial_analysis_indicator(symbol=code)
             if df is not None and not df.empty:
                 latest = df.iloc[-1]
@@ -219,8 +248,50 @@ class AKShareClient:
                     "profit_growth": latest.get("净利润增长率", None),
                     "debt_ratio": latest.get("资产负债率", None),
                 }
+                if result.get("pe") is not None:
+                    return result  # AKShare成功，直接返回
         except Exception as e:
             print(f"[AKShare] 获取财务数据失败 {code}: {e}")
+
+        # 2. Sina：PE/PB/市值/名称（快）
+        fetcher = AKShareClient._load_sina_fetcher()
+        if fetcher is not None:
+            try:
+                sina = fetcher.get_stock_realtime(code)
+                if sina:
+                    result = {
+                        "pe": sina.get("pe") if sina.get("pe", 0) > 0 else None,
+                        "pb": sina.get("pb") if sina.get("pb", 0) > 0 else None,
+                        "roe": None,
+                        "revenue_growth": None,
+                        "profit_growth": None,
+                        "debt_ratio": None,
+                        "_name": sina.get("name", ""),
+                        "_mktcap": sina.get("mktcap", 0),
+                        "_sina_source": True,
+                    }
+                    print(f"[Sina] 已获取 {code} 的 PE/PB/市值")
+            except Exception as e:
+                print(f"[Sina] 实时行情获取失败 {code}: {e}")
+
+        # 3. Tushare：ROE/负债率/营收增速/利润增速（补深度财务）
+        try:
+            from .tushare_client import get_financial_indicators
+            ts_fin = get_financial_indicators(code)
+            if ts_fin:
+                if not result:
+                    result = {}
+                result["roe"] = ts_fin.get("roe")
+                result["debt_ratio"] = ts_fin.get("debt_to_assets")
+                result["revenue_growth"] = ts_fin.get("or_yoy")
+                result["profit_growth"] = ts_fin.get("profit_yoy")
+                result["_report_date"] = ts_fin.get("report_date", "")
+                result["_ts_source"] = True
+                print(f"[Tushare] 已获取 {code} 的 ROE/负债率/增速 "
+                      f"(报告期: {ts_fin.get('report_date', '?')})")
+        except Exception as e:
+            print(f"[Tushare] 财务指标获取失败 {code}: {e}")
+
         return result
 
     # ============================================================
@@ -259,12 +330,14 @@ class AKShareClient:
     @staticmethod
     def get_hot_sectors() -> list[dict]:
         """获取热门板块 — 区分主线/支线/一日游"""
+        import socket
         sectors = []
+        old_timeout = socket.getdefaulttimeout()
         try:
             import akshare as ak
+            socket.setdefaulttimeout(3)
             df = ak.stock_board_industry_name_em()
             if df is not None and not df.empty:
-                # 按涨跌幅排序
                 df_sorted = df.sort_values(by="涨跌幅", ascending=False)
                 for _, row in df_sorted.head(10).iterrows():
                     change = float(row.get("涨跌幅", 0))
@@ -276,4 +349,118 @@ class AKShareClient:
                     })
         except Exception as e:
             print(f"[AKShare] 获取热门板块失败: {e}")
+        finally:
+            socket.setdefaulttimeout(old_timeout)
         return sectors
+
+    # ============================================================
+    # Sina 股票列表（免费、实时PE/PB/市值/换手率）
+    # ============================================================
+
+    @staticmethod
+    def get_stock_pool(min_mktcap: float = 50, max_pe: float = 200,
+                       exclude_st: bool = True) -> pd.DataFrame:
+        """
+        从缓存+Sina实时数据筛选候选池
+        :param min_mktcap: 最小总市值(亿)
+        :param max_pe: 最大市盈率
+        :param exclude_st: 排除ST
+        :return: DataFrame with code, name, pe, pb, mktcap, changepercent
+        """
+        from .stock_cache import get_stock_pool as cached_pool
+        results = cached_pool(min_mktcap=min_mktcap, max_pe=max_pe, exclude_st=exclude_st)
+        if results:
+            return pd.DataFrame(results)
+
+        # 缓存不可用时回退 Sina
+        fetcher = AKShareClient._load_sina_fetcher()
+        if fetcher is None:
+            return pd.DataFrame()
+
+        try:
+            df = fetcher.get_stock_list()
+            if df.empty:
+                return df
+            df = df[df["mktcap"] >= min_mktcap]
+            df = df[(df["pe"] > 0) & (df["pe"] <= max_pe)]
+            if exclude_st:
+                df = df[~df["name"].str.contains("ST|退市", na=False)]
+            return df.sort_values("mktcap", ascending=False).reset_index(drop=True)
+        except Exception as e:
+            print(f"[Sina] 获取股票列表失败: {e}")
+            return pd.DataFrame()
+
+    # ============================================================
+    # Tushare 数据（复权因子 / 交易日历 / 停复牌 — 120积分）
+    # ============================================================
+
+    @staticmethod
+    def get_adj_factor(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """获取复权因子（Tushare）"""
+        try:
+            from .tushare_client import get_adj_factor
+            return get_adj_factor(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def get_trade_calendar(start_date: str, end_date: str) -> pd.DataFrame:
+        """获取交易日历（Tushare）"""
+        try:
+            from .tushare_client import get_trade_cal
+            return get_trade_cal(start_date=start_date, end_date=end_date)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def search_stocks(keyword: str) -> list[dict]:
+        """按名称或代码搜索股票，优先使用缓存"""
+        # 1. 缓存优先（毫秒级响应）
+        cached = search_cached(keyword)
+        if cached:
+            return cached
+
+        # 2. 缓存为空则触发同步后重试
+        if needs_sync():
+            sync_cache()
+            cached = search_cached(keyword)
+            if cached:
+                return cached
+
+        # 3. 缓存不可用，回退 Sina/AKShare
+        results: list[dict] = []
+        fetcher = AKShareClient._load_sina_fetcher()
+        if fetcher is not None:
+            try:
+                df = fetcher.get_stock_list()
+                if not df.empty:
+                    kw = keyword.strip().upper()
+                    mask = df["code"].str.contains(kw, na=False) | df["name"].str.contains(kw, na=False)
+                    matched = df[mask].head(10)
+                    for _, row in matched.iterrows():
+                        results.append({
+                            "code": str(row.get("code", "")),
+                            "name": str(row.get("name", "")),
+                        })
+            except Exception as e:
+                print(f"[Sina] 搜索股票失败: {e}")
+
+        if not results:
+            try:
+                import akshare as ak
+                df = ak.stock_info_a_code_name()
+                if df is not None and not df.empty:
+                    kw = keyword.strip().upper()
+                    code_col = "code" if "code" in df.columns else "代码"
+                    name_col = "name" if "name" in df.columns else "名称"
+                    mask = df[code_col].str.contains(kw, na=False) | df[name_col].str.contains(kw, na=False)
+                    matched = df[mask].head(10)
+                    for _, row in matched.iterrows():
+                        results.append({
+                            "code": str(row.get(code_col, "")),
+                            "name": str(row.get(name_col, "")),
+                        })
+            except Exception as e:
+                print(f"[AKShare] 搜索股票失败: {e}")
+
+        return results

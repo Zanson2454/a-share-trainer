@@ -148,7 +148,7 @@ class BacktestEngine:
         strategy_fn: Callable,
         strategy_name: str,
         benchmark_df: Optional[pd.DataFrame] = None,
-        initial_capital: float = 100000,
+        initial_capital: float = 1000000,
         commission: float = 0.0003,  # 万三手续费
     ) -> BacktestResult:
         """

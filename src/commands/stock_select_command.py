@@ -51,21 +51,22 @@ def execute(args: list = None) -> str:
         lines.append("### 候选股评分")
         lines.append("")
         if not sectors:
-            lines.append("> ⚠️ 板块数据暂不可用，本次使用默认观察池；政策/热点分按待确认处理")
+            lines.append("> ⚠️ 板块数据暂不可用，政策/热点分按待确认处理")
             lines.append("")
 
         hot_codes = []
-        hot_source = "实时行情"  # 数据来源说明
+        hot_source = "实时行情"
         try:
-            import akshare as ak
-            spot_df = ak.stock_zh_a_spot_em()
-            if spot_df is not None and not spot_df.empty:
-                top = spot_df.nlargest(20, "涨跌幅")
-                hot_codes = top["代码"].head(10).tolist()
+            # 优先用 Sina 全A股列表筛选
+            pool = AKShareClient.get_stock_pool(min_mktcap=50, max_pe=200)
+            if not pool.empty:
+                # 取市值前20只作为候选
+                hot_codes = pool["code"].head(20).tolist()
+                hot_source = f"Sina全A股筛选(市值>50亿,PE<200,共{len(pool)}只)"
             else:
-                hot_source = "实时行情（获取为空）→ 默认观察池"
+                hot_source = "Sina数据为空 → 默认观察池"
         except Exception:
-            hot_source = "实时行情（AKShare不可用）→ 默认观察池"
+            hot_source = "数据获取失败 → 默认观察池"
 
         if not hot_codes:
             hot_codes = DEFAULT_UNIVERSE
