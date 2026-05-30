@@ -33,10 +33,11 @@ export const getPremarket = () =>
 export const getScreening = (codes?: string[]) =>
   api.get<ScreeningResponse>('/screening', {
     params: codes?.length ? { codes: codes.join(',') } : {},
+    timeout: 90000,
   }).then(r => r.data)
 
 export const postNaturalScreening = (query: string) =>
-  api.post<ScreeningResponse>('/screening/natural', { query }, { timeout: 60000 }).then(r => r.data)
+  api.post<ScreeningResponse>('/screening/natural', { query }, { timeout: 120000 }).then(r => r.data)
 
 // ── 个股分析 ──
 export const getStockAnalysis = (code: string) =>
