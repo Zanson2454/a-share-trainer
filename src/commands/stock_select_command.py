@@ -41,9 +41,24 @@ def execute(args: list = None) -> str:
     try:
         sectors = AKShareClient.get_hot_sectors()
         sector_names = [s.get("name", "") for s in sectors] if sectors else []
-        policy_score = 15 if sectors else 5
-        policy_desc = "热点板块: " + "、".join(sector_names[:3]) if sectors else "板块/政策数据待人工确认"
+        default_policy_desc = "热点板块: " + "、".join(sector_names[:3]) if sectors else "板块/政策数据待人工确认"
         market_score, market_desc = _score_market_env()
+
+        # 构建板块成分股反向索引
+        stock_to_sector: dict[str, str] = {}
+        sector_info_map: dict[str, dict] = {}
+        for s in (sectors or [])[:8]:
+            name = s.get("name", "")
+            sector_info_map[name] = {"change": s.get("change", 0), "category": s.get("category", "一日游")}
+            try:
+                import akshare as ak
+                df = ak.stock_board_industry_cons_em(symbol=name)
+                if df is not None and not df.empty:
+                    code_col = "代码" if "代码" in df.columns else "code"
+                    for c in df[code_col]:
+                        stock_to_sector[str(c)] = name
+            except Exception:
+                pass
 
         lines.append("### 候选股评分")
         lines.append("")
@@ -66,7 +81,7 @@ def execute(args: list = None) -> str:
         lines.append(f"### 候选池来源: {hot_source}")
         lines.append("")
 
-        for code in hot_codes[:5]:
+        for code in hot_codes:
             stock = StockScore(code=code)
             kline = AKShareClient.get_daily_kline(code)
             if kline is None or kline.empty:
@@ -82,12 +97,31 @@ def execute(args: list = None) -> str:
 
             stock.market_env = market_score
             fin = AKShareClient.get_financial_data(code)
-            fund = FundamentalScorer.score(fin)
+            stock.name = fin.get("_name", "") or stock.name
+
+            # 行业相对PE评分
+            industry = fin.get("_industry", "") or ""
+            stock.industry = industry
+            fund = FundamentalScorer.score(fin, industry)
             stock.fundamental = fund["score"]
             stock.fundamental_desc = fund["desc"]
 
-            stock.policy_hot = policy_score
-            stock.policy_desc = policy_desc
+            # 按个股所属板块差异化热点评分
+            sector_name = stock_to_sector.get(code, "")
+            if sector_name and sector_name in sector_info_map:
+                info = sector_info_map[sector_name]
+                cat = info["category"]
+                chg = info["change"]
+                if cat == "主线":
+                    stock.policy_hot = min(20, 15 + chg / 2)
+                elif cat == "支线":
+                    stock.policy_hot = min(15, 10 + chg / 2)
+                else:
+                    stock.policy_hot = max(5, 10 - abs(chg) / 2)
+                stock.policy_desc = f"所属「{sector_name}」为{cat}(涨{chg:+.1f}%)"
+            else:
+                stock.policy_hot = 8
+                stock.policy_desc = default_policy_desc
             stock.risk_control = 8
 
             stock.reasons = [

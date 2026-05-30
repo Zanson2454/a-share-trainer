@@ -4,6 +4,73 @@ from ..data.akshare_client import AKShareClient
 from ..scorer import StockScore, FundamentalScorer, MarketEnvScorer, TechnicalScorer
 
 
+def _build_sector_map() -> tuple[dict[str, dict], list[dict]]:
+    """获取热点板块，构建 板块名→(分类,得分) 映射 + 成分股反向索引"""
+    sectors = AKShareClient.get_hot_sectors()
+    if not sectors:
+        return {}, [], {}
+
+    # 板块名 → 涨跌幅+分类
+    sector_info: dict[str, dict] = {}
+    for s in sectors:
+        name = s.get("name", "")
+        cat = s.get("category", "一日游")
+        chg = s.get("change", 0)
+        sector_info[name] = {"change": chg, "category": cat}
+
+    # 构建 股票代码→板块 反向映射（只覆盖热门板块）
+    stock_to_sector: dict[str, str] = {}
+    for s in sectors[:8]:  # 最多取前8个板块的成分股
+        try:
+            import akshare as ak
+            df = ak.stock_board_industry_cons_em(symbol=s.get("name", ""))
+            if df is not None and not df.empty:
+                code_col = "代码" if "代码" in df.columns else "code"
+                for code in df[code_col]:
+                    stock_to_sector[str(code)] = s.get("name", "")
+        except Exception:
+            pass
+
+    return sector_info, sectors, stock_to_sector
+
+
+def _score_policy_for_stock(code: str, stock_to_sector: dict[str, str],
+                            sector_info: dict[str, dict]) -> tuple[float, str]:
+    """按个股所属板块返回差异化热点得分"""
+    sector_name = stock_to_sector.get(code, "")
+    if sector_name and sector_name in sector_info:
+        info = sector_info[sector_name]
+        cat = info["category"]
+        chg = info["change"]
+        if cat == "主线":
+            # 15-20分，涨幅越大越接近20
+            score = min(20, 15 + chg / 2)
+            desc = f"所属「{sector_name}」为主线(涨{chg:+.1f}%)"
+        elif cat == "支线":
+            score = min(15, 10 + chg / 2)
+            desc = f"所属「{sector_name}」为支线(涨{chg:+.1f}%)"
+        else:
+            score = max(5, 10 - abs(chg) / 2)
+            desc = f"所属「{sector_name}」为一曰游(涨{chg:+.1f}%)"
+        return score, desc
+    # 未匹配到热门板块
+    return 8, "未匹配当前热门板块"
+
+
+def _get_stock_industry(code: str) -> str:
+    """获取个股所属行业"""
+    try:
+        import akshare as ak
+        df = ak.stock_individual_info_em(symbol=code)
+        if df is not None and not df.empty:
+            row = df[df["item"] == "行业"]
+            if not row.empty:
+                return str(row.iloc[0]["value"])
+    except Exception:
+        pass
+    return ""
+
+
 def _score_market_env() -> tuple[float, str]:
     """用上证指数估算大盘环境；失败时返回中性分"""
     index_df = AKShareClient.get_index_data("000001")
@@ -38,15 +105,14 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
         return result
 
     try:
-        sectors = AKShareClient.get_hot_sectors()
+        sector_info, sectors, stock_to_sector = _build_sector_map()
         sector_names = [s.get("name", "") for s in sectors] if sectors else []
-        policy_score = 15 if sectors else 5
-        policy_desc = "热点板块: " + "、".join(sector_names[:3]) if sector_names else "板块/政策数据待人工确认"
+        default_policy_desc = "热点板块: " + "、".join(sector_names[:3]) if sector_names else "板块/政策数据待人工确认"
         market_score, market_trend = _score_market_env()
         result["market_score"] = market_score
         result["market_trend"] = market_trend
 
-        # 候选池
+        # 候选池：涨幅前20，按 涨跌幅×成交额 排序（强度+流动性）
         hot_codes = list(codes or [])
         pool_source = "用户指定"
         if not hot_codes:
@@ -54,9 +120,13 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
                 import akshare as ak
                 spot_df = ak.stock_zh_a_spot_em()
                 if spot_df is not None and not spot_df.empty:
-                    top = spot_df.nlargest(20, "涨跌幅")
-                    hot_codes = top["代码"].head(10).tolist()
-                    pool_source = "实时行情（涨幅榜前10）"
+                    top20 = spot_df.nlargest(20, "涨跌幅").copy()
+                    # 按 涨跌幅×成交额 排序，兼顾强度和流动性
+                    if "成交额" in top20.columns:
+                        top20["_rank"] = top20["涨跌幅"].astype(float) * top20["成交额"].astype(float).rank(pct=True)
+                        top20 = top20.sort_values("_rank", ascending=False)
+                    hot_codes = top20["代码"].tolist()
+                    pool_source = "实时行情（涨幅前20，按强度×流动性排序）"
                 else:
                     result["error"] = "无法获取实时行情数据"
                     return result
@@ -83,12 +153,18 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
             stock.market_env = market_score
             fin = AKShareClient.get_financial_data(code)
             stock.name = fin.get("_name", "") or stock.name
-            fund = FundamentalScorer.score(fin)
+
+            # 行业相对PE评分
+            industry = _get_stock_industry(code) or fin.get("industry", "")
+            stock.industry = industry
+            fund = FundamentalScorer.score(fin, industry)
             stock.fundamental = fund["score"]
             stock.fundamental_desc = fund["desc"]
 
-            stock.policy_hot = policy_score
-            stock.policy_desc = policy_desc
+            # 按个股所属板块差异化热点评分
+            ps, pd = _score_policy_for_stock(code, stock_to_sector, sector_info)
+            stock.policy_hot = ps
+            stock.policy_desc = pd or default_policy_desc
             stock.risk_control = 8
 
             stock.reasons = [

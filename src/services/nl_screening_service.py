@@ -115,6 +115,36 @@ def parse_query(query: str) -> dict:
     return result
 
 
+def _get_board_names_for_industry(industry: str) -> list[str]:
+    """将行业关键词映射到AKShare标准板块名称"""
+    mapping: dict[str, list[str]] = {
+        "白酒": ["白酒", "酿酒行业"],
+        "消费": ["食品饮料", "商业百货", "纺织服装"],
+        "新能源": ["新能源", "太阳能", "风能"],
+        "电池": ["电池", "锂电池"],
+        "光伏": ["光伏设备", "太阳能"],
+        "医药": ["医药制造", "中药", "化学制药", "生物制品"],
+        "医疗": ["医疗器械"],
+        "半导体": ["半导体"],
+        "芯片": ["半导体", "芯片"],
+        "银行": ["银行"],
+        "保险": ["保险"],
+        "券商": ["券商信托", "证券"],
+        "科技": ["软件开发", "互联网服务", "通信设备", "电子元件"],
+        "AI": ["人工智能", "机器人概念"],
+        "汽车": ["汽车整车", "汽车零部件"],
+        "家电": ["家电行业"],
+        "地产": ["房地产开发", "房地产服务"],
+        "军工": ["航天航空", "船舶制造"],
+        "有色": ["有色金属"],
+        "煤炭": ["煤炭行业"],
+        "电力": ["电力行业"],
+        "化工": ["化学制品", "化学原料"],
+        "钢铁": ["钢铁行业"],
+    }
+    return mapping.get(industry, [industry])
+
+
 def _get_full_stock_list():
     """获取全市场股票列表（原始数据，无过滤），返回 DataFrame 或 None"""
     import pandas as pd
@@ -149,17 +179,44 @@ def _get_full_stock_list():
 
 
 def _filter_stock_pool(intent: dict) -> tuple[list[dict], str]:
-    """从全市场动态筛选候选股"""
+    """从全市场动态筛选候选股，优先使用标准行业分类"""
     import pandas as pd
     pool = _get_full_stock_list()
     if pool is None or pool.empty:
         return [], "全市场数据获取失败"
 
     total_count = len(pool)
+    industry_codes: set[str] = set()
 
-    # 名称关键词筛选（最先执行，缩小范围）
+    # 行业匹配：优先使用标准行业板块成分股
+    industry_name = intent.get("industry_name", "")
     name_kws = intent.get("name_keywords", [])
-    if name_kws:
+    if industry_name:
+        found_standard = False
+        # 尝试用常见板块名匹配标准行业
+        board_names = _get_board_names_for_industry(industry_name)
+        for bn in board_names:
+            try:
+                import akshare as ak
+                df = ak.stock_board_industry_cons_em(symbol=bn)
+                if df is not None and not df.empty:
+                    code_col = "代码" if "代码" in df.columns else "code"
+                    for c in df[code_col]:
+                        industry_codes.add(str(c))
+                    found_standard = True
+            except Exception:
+                pass
+        if found_standard and industry_codes:
+            # 用标准行业成分股过滤
+            pool = pool[pool["code"].astype(str).isin(industry_codes)]
+        elif name_kws:
+            # 标准行业匹配失败时，回退到名称关键词匹配
+            pattern = "|".join(re.escape(kw) for kw in name_kws)
+            mask = pool["name"].str.contains(pattern, case=False, na=False)
+            pool = pool[mask]
+
+    # 名称关键词筛选（非行业类关键词，如"消费"同时有行业和名称匹配）
+    elif name_kws:
         pattern = "|".join(re.escape(kw) for kw in name_kws)
         mask = pool["name"].str.contains(pattern, case=False, na=False)
         pool = pool[mask]
@@ -232,7 +289,9 @@ def _score_market_env() -> tuple[float, str]:
 def _score_one_stock(code: str, market_score: float, market_trend: str,
                      policy_score: float, policy_desc: str,
                      raw_query: str, fundamental_filters: list[dict],
-                     technical_notes: list[str]) -> dict | None:
+                     technical_notes: list[str],
+                     stock_to_sector: dict[str, str] = None,
+                     sector_info: dict[str, dict] = None) -> dict | None:
     """对单只股票评分，出错时返回 None"""
     try:
         end_date = datetime.now().strftime("%Y%m%d")
@@ -248,17 +307,36 @@ def _score_one_stock(code: str, market_score: float, market_trend: str,
         tech = TechnicalScorer.score(kline)
 
         fin = AKShareClient.get_financial_data(code)
-        fund = FundamentalScorer.score(fin)
+        industry = fin.get("_industry", "") or ""
+        fund = FundamentalScorer.score(fin, industry)
+
+        # 按个股所属板块差异化热点评分
+        ps = policy_score
+        pd = policy_desc
+        if stock_to_sector and sector_info:
+            sector_name = stock_to_sector.get(code, "")
+            if sector_name and sector_name in sector_info:
+                info = sector_info[sector_name]
+                cat = info["category"]
+                chg = info["change"]
+                if cat == "主线":
+                    ps = min(20, 15 + chg / 2)
+                elif cat == "支线":
+                    ps = min(15, 10 + chg / 2)
+                else:
+                    ps = max(5, 10 - abs(chg) / 2)
+                pd = f"所属「{sector_name}」为{cat}(涨{chg:+.1f}%)"
 
         stock = StockScore(code=code)
         stock.name = fin.get("_name", "") or ""
+        stock.industry = industry
         stock.technical = tech["score"]
         stock.technical_desc = tech["desc"]
         stock.fundamental = fund["score"]
         stock.fundamental_desc = fund["desc"]
         stock.market_env = market_score
-        stock.policy_hot = policy_score
-        stock.policy_desc = policy_desc
+        stock.policy_hot = ps
+        stock.policy_desc = pd
         stock.risk_control = 8
 
         for ff in fundamental_filters:
@@ -348,11 +426,28 @@ def screen_by_natural_language(query: str) -> dict:
             result["error"] = "没有匹配的股票，请尝试更宽泛的条件"
             return result
 
-        # Step 2: 大盘环境
+        # Step 2: 大盘环境 + 板块映射
         sectors = AKShareClient.get_hot_sectors()
         sector_names = [s.get("name", "") for s in sectors] if sectors else []
         policy_score = 15 if sectors else 5
         policy_desc = "热点板块: " + "、".join(sector_names[:3]) if sector_names else "板块/政策数据待人工确认"
+
+        # 构建板块→成分股反向索引
+        stock_to_sector: dict[str, str] = {}
+        sector_info_map: dict[str, dict] = {}
+        for s in (sectors or [])[:8]:
+            name = s.get("name", "")
+            sector_info_map[name] = {"change": s.get("change", 0), "category": s.get("category", "一日游")}
+            try:
+                import akshare as ak
+                df = ak.stock_board_industry_cons_em(symbol=name)
+                if df is not None and not df.empty:
+                    code_col = "代码" if "代码" in df.columns else "code"
+                    for c in df[code_col]:
+                        stock_to_sector[str(c)] = name
+            except Exception:
+                pass
+
         market_score, market_trend = _score_market_env()
         result["market_score"] = market_score
         result["market_trend"] = market_trend
@@ -368,6 +463,7 @@ def screen_by_natural_language(query: str) -> dict:
                     market_score, market_trend,
                     policy_score, policy_desc,
                     intent["raw"], intent["fundamental_filters"], intent["technical_notes"],
+                    stock_to_sector, sector_info_map,
                 ): code for code in codes
             }
             for future in concurrent.futures.as_completed(futures):

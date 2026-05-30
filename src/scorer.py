@@ -5,6 +5,49 @@
 """
 from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
+
+
+# 行业PE参考区间（基于A股历史分位数）
+INDUSTRY_PE_RANGES: dict[str, tuple[float, float, str]] = {
+    # 行业关键词 → (低估阈值, 高估阈值, 行业名)
+    "银行": (4, 10, "银行"),
+    "保险": (8, 20, "保险"),
+    "券商": (10, 30, "券商"),
+    "地产": (5, 15, "地产"),
+    "钢铁": (6, 20, "钢铁"),
+    "煤炭": (6, 15, "煤炭"),
+    "有色": (15, 40, "有色"),
+    "化工": (12, 35, "化工"),
+    "电力": (10, 25, "电力"),
+    "建筑": (6, 20, "建筑"),
+    "白酒": (20, 50, "白酒"),
+    "消费": (20, 50, "消费"),
+    "食品": (20, 45, "食品饮料"),
+    "家电": (12, 30, "家电"),
+    "医药": (25, 60, "医药"),
+    "医疗": (25, 60, "医疗器械"),
+    "新能源": (15, 50, "新能源"),
+    "光伏": (15, 50, "光伏"),
+    "电池": (20, 55, "电池"),
+    "汽车": (10, 35, "汽车"),
+    "半导体": (30, 80, "半导体"),
+    "芯片": (30, 80, "芯片"),
+    "科技": (25, 70, "科技"),
+    "AI": (30, 80, "AI"),
+    "军工": (30, 70, "军工"),
+    "传媒": (15, 40, "传媒"),
+}
+
+
+def _match_industry_pe_range(industry: str) -> tuple[float, float] | None:
+    """根据行业名称模糊匹配PE参考区间，返回 (低估阈值, 高估阈值)"""
+    if not industry:
+        return None
+    for kw, (lo, hi, _) in INDUSTRY_PE_RANGES.items():
+        if kw in industry:
+            return (lo, hi)
+    return None
 
 
 @dataclass
@@ -126,7 +169,7 @@ class MarketEnvScorer:
 
 
 class TechnicalScorer:
-    """技术面评分器（0-25分）"""
+    """技术面评分器（0-25分），含趋势强度和放量位置判断"""
 
     @staticmethod
     def score(kline_df) -> dict:
@@ -137,7 +180,7 @@ class TechnicalScorer:
         if kline_df is None or kline_df.empty:
             return {"score": 0, "desc": "数据不足", "signals": []}
 
-        score = 12.5  # 基准分
+        score = 12.5
         signals = []
         last = kline_df.iloc[-1]
 
@@ -157,12 +200,43 @@ class TechnicalScorer:
         if close > ma60:
             score += 3
             signals.append("站上60日线")
+        else:
+            score -= 1
 
-        # 成交量
+        # MA60 斜率（趋势强度）
+        ma60_series = kline_df["ma60"].dropna()
+        if len(ma60_series) >= 20:
+            recent = ma60_series.tail(20)
+            x = np.arange(len(recent))
+            slope = np.polyfit(x, recent.values, 1)[0]
+            avg_ma60 = recent.mean()
+            if avg_ma60 > 0:
+                slope_pct = slope / avg_ma60 * 100
+                if slope_pct > 0.5:
+                    score += 2
+                    signals.append("MA60上行")
+                elif slope_pct < -0.5:
+                    score -= 2
+                    signals.append("MA60下行")
+
+        # 成交量 + 位置判断
         avg_vol = kline_df["volume"].tail(20).mean()
-        if last.get("volume", 0) > avg_vol * 1.5:
-            score += 2
-            signals.append("放量")
+        vol = last.get("volume", 0)
+        if vol > avg_vol * 1.5 and ma60 > 0:
+            # 判断价格相对位置：高位还是低位
+            price_vs_ma60 = close / ma60
+            if price_vs_ma60 < 0.95:
+                score += 3
+                signals.append("低位放量")
+            elif price_vs_ma60 < 1.05:
+                score += 2
+                signals.append("均线附近放量")
+            elif price_vs_ma60 > 1.2:
+                score -= 2
+                signals.append("高位放量(谨慎)")
+            else:
+                score += 1
+                signals.append("放量")
 
         return {
             "score": max(0, min(25, score)),
@@ -172,23 +246,48 @@ class TechnicalScorer:
 
 
 class FundamentalScorer:
-    """基本面评分器（0-25分）"""
+    """基本面评分器（0-25分），引入行业相对估值"""
 
     @staticmethod
-    def score(financial: dict) -> dict:
+    def score(financial: dict, industry: str = "") -> dict:
         """
         :param financial: {pe, pb, roe, revenue_growth, profit_growth, debt_ratio}
+        :param industry: 所属行业，用于行业相对PE判断
         """
         score = 12.5
         desc_parts = []
 
         pe = financial.get("pe")
-        if pe and 0 < pe < 30:
-            score += 3
-            desc_parts.append(f"PE={pe:.1f}合理")
-        elif pe and pe > 100:
-            score -= 3
-            desc_parts.append(f"PE={pe:.1f}偏高")
+        pe_range = _match_industry_pe_range(industry) if industry else None
+
+        if pe and pe > 0:
+            if pe_range:
+                lo, hi = pe_range
+                if pe <= lo:
+                    score += 4
+                    desc_parts.append(f"PE={pe:.1f}(低于{industry}均值{lo})，低估")
+                elif pe <= hi:
+                    score += 2
+                    desc_parts.append(f"PE={pe:.1f}({industry}区间{lo}-{hi})，合理")
+                elif pe > hi * 2:
+                    score -= 3
+                    desc_parts.append(f"PE={pe:.1f}(远超{industry}高估线{hi})，偏高")
+                else:
+                    score -= 1
+                    desc_parts.append(f"PE={pe:.1f}(高于{industry}区间上限{hi})")
+            else:
+                # 无行业参考，使用通用阈值
+                if pe < 20:
+                    score += 3
+                    desc_parts.append(f"PE={pe:.1f}偏低")
+                elif pe < 40:
+                    score += 1
+                    desc_parts.append(f"PE={pe:.1f}合理")
+                elif pe > 100:
+                    score -= 3
+                    desc_parts.append(f"PE={pe:.1f}偏高")
+        elif pe == 0:
+            desc_parts.append("PE=0（可能亏损）")
 
         roe = financial.get("roe")
         if roe and roe > 15:
