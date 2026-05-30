@@ -3,8 +3,6 @@
 from ..data.akshare_client import AKShareClient
 from ..scorer import StockScore, FundamentalScorer, MarketEnvScorer, TechnicalScorer
 
-DEFAULT_UNIVERSE = ["600519", "000858", "300750", "002594", "601318"]
-
 
 def _score_market_env() -> tuple[float, str]:
     """用上证指数估算大盘环境；失败时返回中性分"""
@@ -32,9 +30,11 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
         "candidates": [],
         "pool_source": "",
         "total_in_pool": 0,
+        "error": None,
     }
 
     if not AKShareClient.check_available():
+        result["error"] = "AKShare 未安装，无法获取实时行情"
         return result
 
     try:
@@ -58,11 +58,11 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
                     hot_codes = top["代码"].head(10).tolist()
                     pool_source = "实时行情（涨幅榜前10）"
                 else:
-                    hot_codes = DEFAULT_UNIVERSE
-                    pool_source = "默认观察池"
-            except Exception:
-                hot_codes = DEFAULT_UNIVERSE
-                pool_source = "默认观察池"
+                    result["error"] = "无法获取实时行情数据"
+                    return result
+            except Exception as e:
+                result["error"] = f"获取实时行情失败: {e}"
+                return result
 
         result["pool_source"] = pool_source
 

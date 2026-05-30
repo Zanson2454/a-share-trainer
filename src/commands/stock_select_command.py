@@ -6,9 +6,6 @@ from ..scorer import StockScore, FundamentalScorer, MarketEnvScorer, TechnicalSc
 from ..obsidian_sync import ObsidianSync
 
 
-DEFAULT_UNIVERSE = ["600519", "000858", "300750", "002594", "601318"]
-
-
 def _score_market_env() -> tuple[float, str]:
     """用上证指数估算大盘环境；失败时返回中性分。"""
     index_df = AKShareClient.get_index_data("000001")
@@ -55,27 +52,18 @@ def execute(args: list = None) -> str:
             lines.append("")
 
         hot_codes = []
-        hot_source = "实时行情"
         try:
-            # 优先用 Sina 全A股列表筛选
             pool = AKShareClient.get_stock_pool(min_mktcap=50, max_pe=200)
             if not pool.empty:
-                # 取市值前20只作为候选
                 hot_codes = pool["code"].head(20).tolist()
                 hot_source = f"Sina全A股筛选(市值>50亿,PE<200,共{len(pool)}只)"
             else:
-                hot_source = "Sina数据为空 → 默认观察池"
-        except Exception:
-            hot_source = "数据获取失败 → 默认观察池"
-
-        if not hot_codes:
-            hot_codes = DEFAULT_UNIVERSE
+                return "❌ 无法获取股票池数据，请检查 Sina 数据管道或网络连接"
+        except Exception as e:
+            return f"❌ 数据获取失败: {e}"
 
         # 告知用户候选池来源
         lines.append(f"### 候选池来源: {hot_source}")
-        lines.append(f"观察池: {' '.join(hot_codes[:5])}")
-        if hot_source != "实时行情":
-            lines.append("> ⚠️ 当前使用默认观察池，非实时热门股。配置 akshare 后可获取真实涨幅榜。")
         lines.append("")
 
         for code in hot_codes[:5]:
