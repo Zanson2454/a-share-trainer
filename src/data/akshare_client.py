@@ -232,65 +232,120 @@ class AKShareClient:
 
     @staticmethod
     def get_financial_data(code: str) -> dict:
-        """获取财务指标（AKShare → Sina(PE/PB) → Tushare(ROE/负债/增速) 三源合并）"""
-        result = {}
-        # 1. 尝试 AKShare（完整财务，一次搞定）
+        """获取财务指标 — 三源合并，追踪来源和时效性"""
+        fields = ["pe", "pb", "roe", "revenue_growth", "profit_growth", "debt_ratio"]
+        result: dict = {f: None for f in fields}
+        sources: dict[str, str] = {f: "" for f in fields}
+        report_dates: dict[str, str] = {}
+        quality_notes: list[str] = []
+
+        # 1. AKShare（完整财务，报告期明确）
         try:
             import akshare as ak
             df = ak.stock_financial_analysis_indicator(symbol=code)
             if df is not None and not df.empty:
-                latest = df.iloc[-1]
-                result = {
-                    "pe": latest.get("市盈率", None),
-                    "pb": latest.get("市净率", None),
-                    "roe": latest.get("净资产收益率", None),
-                    "revenue_growth": latest.get("营业收入增长率", None),
-                    "profit_growth": latest.get("净利润增长率", None),
-                    "debt_ratio": latest.get("资产负债率", None),
+                latest_row = df.iloc[-1]
+                # AKShare 列名是中文
+                ak_map = {
+                    "pe": "市盈率", "pb": "市净率", "roe": "净资产收益率",
+                    "revenue_growth": "营业收入增长率", "profit_growth": "净利润增长率",
+                    "debt_ratio": "资产负债率",
                 }
-                if result.get("pe") is not None:
-                    return result  # AKShare成功，直接返回
+                for field, col in ak_map.items():
+                    val = latest_row.get(col)
+                    if val is not None:
+                        try:
+                            result[field] = float(val)
+                        except (ValueError, TypeError):
+                            result[field] = None
+                        if result[field] is not None:
+                            sources[field] = "AKShare"
+                # 报告期
+                report_col = None
+                for c in ["报告期", "日期"]:
+                    if c in df.columns:
+                        report_col = c
+                        break
+                if report_col:
+                    rp = str(latest_row.get(report_col, ""))[:10]
+                    if rp:
+                        for f in fields:
+                            report_dates[f] = rp
+                quality_notes.append(f"AKShare: 报告期 {report_dates.get('pe', '?')}")
         except Exception as e:
-            print(f"[AKShare] 获取财务数据失败 {code}: {e}")
+            quality_notes.append(f"AKShare: 获取失败({e})")
 
-        # 2. Sina：PE/PB/市值/名称（快）
+        # 2. Sina（PE/PB/市值/名称 — 实时快照）
         fetcher = AKShareClient._load_sina_fetcher()
         if fetcher is not None:
             try:
                 sina = fetcher.get_stock_realtime(code)
                 if sina:
-                    result = {
-                        "pe": sina.get("pe") if sina.get("pe", 0) > 0 else None,
-                        "pb": sina.get("pb") if sina.get("pb", 0) > 0 else None,
-                        "roe": None,
-                        "revenue_growth": None,
-                        "profit_growth": None,
-                        "debt_ratio": None,
-                        "_name": sina.get("name", ""),
-                        "_mktcap": sina.get("mktcap", 0),
-                        "_sina_source": True,
-                    }
-                    print(f"[Sina] 已获取 {code} 的 PE/PB/市值")
+                    result["_name"] = sina.get("name", "")
+                    result["_mktcap"] = sina.get("mktcap", 0)
+                    result["_industry"] = sina.get("industry", "")
+                    # 交叉校验 PE/PB
+                    for f in ["pe", "pb"]:
+                        sina_val = sina.get(f)
+                        if sina_val and sina_val > 0:
+                            sina_val = float(sina_val)
+                            if result[f] is not None:
+                                diff_pct = abs(result[f] - sina_val) / max(result[f], 1) * 100
+                                if diff_pct > 20:
+                                    quality_notes.append(
+                                        f"{f}: AKShare={result[f]:.1f} vs Sina={sina_val:.1f} 差异{diff_pct:.0f}%"
+                                    )
+                                # Sina PE/PB 是实时数据，优先使用
+                                sources[f] = "Sina(实时)"
+                                result[f] = sina_val
+                            elif not sources[f]:
+                                result[f] = sina_val
+                                sources[f] = "Sina"
+                    quality_notes.append("Sina: PE/PB/市值/名称已获取")
             except Exception as e:
-                print(f"[Sina] 实时行情获取失败 {code}: {e}")
+                quality_notes.append(f"Sina: 获取失败({e})")
 
-        # 3. Tushare：ROE/负债率/营收增速/利润增速（补深度财务）
+        # 3. Tushare（ROE/负债率/增速 — 深度财报）
         try:
             from .tushare_client import get_financial_indicators
             ts_fin = get_financial_indicators(code)
             if ts_fin:
-                if not result:
-                    result = {}
-                result["roe"] = ts_fin.get("roe")
-                result["debt_ratio"] = ts_fin.get("debt_to_assets")
-                result["revenue_growth"] = ts_fin.get("or_yoy")
-                result["profit_growth"] = ts_fin.get("profit_yoy")
-                result["_report_date"] = ts_fin.get("report_date", "")
-                result["_ts_source"] = True
-                print(f"[Tushare] 已获取 {code} 的 ROE/负债率/增速 "
-                      f"(报告期: {ts_fin.get('report_date', '?')})")
+                ts_map = {
+                    "roe": "roe",
+                    "debt_ratio": "debt_to_assets",
+                    "revenue_growth": "or_yoy",
+                    "profit_growth": "profit_yoy",
+                }
+                ts_rp = ts_fin.get("report_date", "")
+                for field, ts_key in ts_map.items():
+                    ts_val = ts_fin.get(ts_key)
+                    if ts_val is not None:
+                        ts_val = float(ts_val)
+                        if result[field] is not None and sources[field] == "AKShare":
+                            diff_pct = abs(result[field] - ts_val) / max(abs(result[field]), 1) * 100
+                            if diff_pct > 15:
+                                quality_notes.append(
+                                    f"{field}: AKShare={result[field]:.1f} vs Tushare={ts_val:.1f} 差异{diff_pct:.0f}%"
+                                )
+                        if not sources[field]:
+                            sources[field] = "Tushare"
+                            result[field] = ts_val
+                        if not report_dates.get(field):
+                            report_dates[field] = ts_rp
+                quality_notes.append(f"Tushare: ROE/负债/增速已获取(报告期 {ts_rp})")
         except Exception as e:
-            print(f"[Tushare] 财务指标获取失败 {code}: {e}")
+            quality_notes.append(f"Tushare: 获取失败({e})")
+
+        # 汇总数据质量
+        source_count = len({s for s in sources.values() if s})
+        covered = sum(1 for v in result.values() if v is not None)
+        result["_sources"] = sources
+        result["_report_dates"] = report_dates
+        result["_data_quality"] = {
+            "fields_covered": f"{covered}/{len(fields)}",
+            "source_count": source_count,
+            "notes": quality_notes,
+        }
 
         return result
 

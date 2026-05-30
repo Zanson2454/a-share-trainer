@@ -57,20 +57,6 @@ def _score_policy_for_stock(code: str, stock_to_sector: dict[str, str],
     return 8, "未匹配当前热门板块"
 
 
-def _get_stock_industry(code: str) -> str:
-    """获取个股所属行业"""
-    try:
-        import akshare as ak
-        df = ak.stock_individual_info_em(symbol=code)
-        if df is not None and not df.empty:
-            row = df[df["item"] == "行业"]
-            if not row.empty:
-                return str(row.iloc[0]["value"])
-    except Exception:
-        pass
-    return ""
-
-
 def _score_market_env() -> tuple[float, str]:
     """用上证指数估算大盘环境；失败时返回中性分"""
     index_df = AKShareClient.get_index_data("000001")
@@ -155,7 +141,7 @@ def screen_stocks(codes: list[str] | None = None) -> dict:
             stock.name = fin.get("_name", "") or stock.name
 
             # 行业相对PE评分
-            industry = _get_stock_industry(code) or fin.get("industry", "")
+            industry = fin.get("_industry", "") or ""
             stock.industry = industry
             fund = FundamentalScorer.score(fin, industry)
             stock.fundamental = fund["score"]
